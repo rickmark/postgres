@@ -106,6 +106,7 @@
 #include "postmaster/postmaster.h"
 #include "postmaster/syslogger.h"
 #include "postmaster/walsummarizer.h"
+#include "postmaster/xpc_postmaster.h"
 #include "replication/logicallauncher.h"
 #include "replication/slotsync.h"
 #include "replication/walsender.h"
@@ -1281,10 +1282,13 @@ PostmasterMain(int argc, char *argv[])
 		pfree(rawstring);
 	}
 
+	InitializeXPCService();
+	on_proc_exit((pg_on_exit_callback) CloseXPCService, 0);
+
 	/*
 	 * check that we have some socket to listen on
 	 */
-	if (NumListenSockets == 0)
+	if (NumListenSockets == 0 && !enable_xpc)
 		ereport(FATAL,
 				(errmsg("no socket created for listening")));
 
@@ -1374,7 +1378,7 @@ PostmasterMain(int argc, char *argv[])
 	 * Currently, macOS is the only platform having pthread_is_threaded_np(),
 	 * so we need not worry whether this HINT is appropriate elsewhere.
 	 */
-	if (pthread_is_threaded_np() != 0)
+	if (!enable_xpc && pthread_is_threaded_np() != 0)
 		ereport(FATAL,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("postmaster became multithreaded during startup"),
@@ -1655,12 +1659,15 @@ DetermineSleepTime(void)
 static void
 ConfigurePostmasterWaitSet(bool accept_connections)
 {
+	pgsocket	xpc_sock = GetXPCListenSocket();
+	int			extra_sockets = (xpc_sock != PGINVALID_SOCKET) ? 1 : 0;
+
 	if (pm_wait_set)
 		FreeWaitEventSet(pm_wait_set);
 	pm_wait_set = NULL;
 
 	pm_wait_set = CreateWaitEventSet(NULL,
-									 accept_connections ? (1 + NumListenSockets) : 1);
+									 accept_connections ? (1 + NumListenSockets + extra_sockets) : 1);
 	AddWaitEventToSet(pm_wait_set, WL_LATCH_SET, PGINVALID_SOCKET, MyLatch,
 					  NULL);
 
@@ -1668,6 +1675,9 @@ ConfigurePostmasterWaitSet(bool accept_connections)
 	{
 		for (int i = 0; i < NumListenSockets; i++)
 			AddWaitEventToSet(pm_wait_set, WL_SOCKET_ACCEPT, ListenSockets[i],
+							  NULL, NULL);
+		if (xpc_sock != PGINVALID_SOCKET)
+			AddWaitEventToSet(pm_wait_set, WL_SOCKET_READABLE, xpc_sock,
 							  NULL, NULL);
 	}
 }
@@ -1735,6 +1745,26 @@ ServerLoop(void)
 						elog(LOG, "could not close client socket: %m");
 				}
 			}
+
+			if (events[i].events & WL_SOCKET_READABLE)
+			{
+				pgsocket	xpc_sock = GetXPCListenSocket();
+
+				if (xpc_sock != PGINVALID_SOCKET && events[i].fd == xpc_sock)
+				{
+					ClientSocket s;
+
+					if (AcceptXPCConnection(&s) == STATUS_OK)
+						BackendStartup(&s);
+
+					/* We no longer need the open socket in this process */
+					if (s.sock != PGINVALID_SOCKET)
+					{
+						if (closesocket(s.sock) != 0)
+							elog(LOG, "could not close client socket: %m");
+					}
+				}
+			}
 		}
 
 		/*
@@ -1757,7 +1787,8 @@ ServerLoop(void)
 		 * With assertions enabled, check regularly for appearance of
 		 * additional threads.  All builds check at start and exit.
 		 */
-		Assert(pthread_is_threaded_np() == 0);
+		if (!enable_xpc)
+			Assert(pthread_is_threaded_np() == 0);
 #endif
 
 		/*
@@ -1947,6 +1978,8 @@ ClosePostmasterPorts(bool am_syslogger)
 	if (bonjour_sdref)
 		close(DNSServiceRefSockFD(bonjour_sdref));
 #endif
+
+	CloseXPCServiceInChild();
 }
 
 
@@ -3717,7 +3750,7 @@ ExitPostmaster(int status)
 	 * This message uses LOG level, because an unclean shutdown at this point
 	 * would usually not look much different from a clean shutdown.
 	 */
-	if (pthread_is_threaded_np() != 0)
+	if (!enable_xpc && pthread_is_threaded_np() != 0)
 		ereport(LOG,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("postmaster became multithreaded"),

@@ -305,8 +305,11 @@ elif host_system == 'darwin'
   # frameworks are part of every macOS, so no option gates this; only the
   # backend links them.
   cdata.set('USE_DARWIN_CODESIGN', 1)
-  backend_deps += dependency('appleframeworks',
+  cdata.set('USE_XPC', 1)
+  darwin_frameworks = dependency('appleframeworks',
     modules: ['Security', 'CoreFoundation'], required: true)
+  backend_deps += darwin_frameworks
+  libpq_deps += darwin_frameworks
 
 elif host_system == 'freebsd'
   sema_kind = 'unnamed_posix'

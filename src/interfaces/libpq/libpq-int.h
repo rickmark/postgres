@@ -310,7 +310,8 @@ typedef enum pg_conn_host_type
 {
 	CHT_HOST_NAME,
 	CHT_HOST_ADDRESS,
-	CHT_UNIX_SOCKET
+	CHT_UNIX_SOCKET,
+	CHT_XPC_SERVICE
 } pg_conn_host_type;
 
 /*
@@ -432,6 +433,7 @@ struct pg_conn
 	char	   *scram_client_key;	/* base64-encoded SCRAM client key */
 	char	   *scram_server_key;	/* base64-encoded SCRAM server key */
 	char	   *sslkeylogfile;	/* where should the client write ssl keylogs */
+	char	   *xpc_service;	/* macOS XPC service name */
 
 	bool		cancelRequest;	/* true if this connection is used to send a
 								 * cancel request, instead of being a normal

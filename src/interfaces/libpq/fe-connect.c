@@ -420,6 +420,10 @@ static const internalPQconninfoOption PQconninfoOptions[] = {
 		"SSL-Key-Log-File", "D", 64,
 	offsetof(struct pg_conn, sslkeylogfile)},
 
+	{"xpc_service", "PGXPCSERVICE", NULL, NULL,
+		"XPC-Service", "", 64,
+	offsetof(struct pg_conn, xpc_service)},
+
 	/* Terminating entry --- MUST BE LAST */
 	{NULL, NULL, NULL, NULL,
 	NULL, NULL, 0}
@@ -1261,7 +1265,20 @@ pqConnectOptions2(PGconn *conn)
 	 * or host options.  If neither is given, assume one host.
 	 */
 	conn->whichhost = 0;
-	if (conn->pghostaddr && conn->pghostaddr[0] != '\0')
+	if (conn->xpc_service && conn->xpc_service[0] != '\0')
+	{
+		conn->nconnhost = 1;
+		conn->connhost = (pg_conn_host *)
+			calloc(conn->nconnhost, sizeof(pg_conn_host));
+		if (conn->connhost == NULL)
+			goto oom_error;
+		conn->connhost[0].type = CHT_XPC_SERVICE;
+		conn->connhost[0].host = strdup(conn->xpc_service);
+		if (conn->connhost[0].host == NULL)
+			goto oom_error;
+		return true;
+	}
+	else if (conn->pghostaddr && conn->pghostaddr[0] != '\0')
 		conn->nconnhost = count_comma_separated_elems(conn->pghostaddr);
 	else if (conn->pghost && conn->pghost[0] != '\0')
 		conn->nconnhost = count_comma_separated_elems(conn->pghost);
@@ -2898,6 +2915,94 @@ pqConnectDBComplete(PGconn *conn)
 	}
 }
 
+#ifdef USE_XPC
+#include <xpc/xpc.h>
+#include <dispatch/dispatch.h>
+
+static pgsocket
+pqConnectXPC(PGconn *conn, const char *service_name)
+{
+	dispatch_queue_t queue;
+	xpc_connection_t xconn;
+	xpc_object_t msg;
+	xpc_object_t reply;
+	const char *status;
+	int			fd;
+
+	if (!service_name || service_name[0] == '\0')
+	{
+		libpq_append_conn_error(conn, "empty XPC service name");
+		return PGINVALID_SOCKET;
+	}
+
+	queue = dispatch_queue_create("org.postgresql.libpq.xpc", DISPATCH_QUEUE_SERIAL);
+	xconn = xpc_connection_create_mach_service(service_name, queue, 0);
+	if (!xconn)
+	{
+		libpq_append_conn_error(conn, "could not create XPC connection to service \"%s\"", service_name);
+		dispatch_release(queue);
+		return PGINVALID_SOCKET;
+	}
+
+	xpc_connection_set_event_handler(xconn, ^(xpc_object_t event) {
+		/* ignore asynchronous notifications */
+	});
+	xpc_connection_resume(xconn);
+
+	msg = xpc_dictionary_create(NULL, NULL, 0);
+	xpc_dictionary_set_string(msg, "action", "connect");
+	reply = xpc_connection_send_message_with_reply_sync(xconn, msg);
+	xpc_release(msg);
+
+	if (!reply || xpc_get_type(reply) == XPC_TYPE_ERROR)
+	{
+		const char *desc = reply ? xpc_dictionary_get_string(reply, XPC_ERROR_KEY_DESCRIPTION) : "no reply from service";
+
+		libpq_append_conn_error(conn, "could not connect to XPC service \"%s\": %s", service_name, desc ? desc : "unknown error");
+		if (reply)
+			xpc_release(reply);
+		xpc_connection_cancel(xconn);
+		xpc_release(xconn);
+		dispatch_release(queue);
+		return PGINVALID_SOCKET;
+	}
+
+	status = xpc_dictionary_get_string(reply, "status");
+	if (!status || strcmp(status, "OK") != 0)
+	{
+		const char *err_msg = xpc_dictionary_get_string(reply, "error_message");
+
+		libpq_append_conn_error(conn, "XPC service error: %s", err_msg ? err_msg : "unknown error");
+		xpc_release(reply);
+		xpc_connection_cancel(xconn);
+		xpc_release(xconn);
+		dispatch_release(queue);
+		return PGINVALID_SOCKET;
+	}
+
+	fd = xpc_dictionary_dup_fd(reply, "fd");
+	xpc_release(reply);
+	xpc_connection_cancel(xconn);
+	xpc_release(xconn);
+	dispatch_release(queue);
+
+	if (fd < 0)
+	{
+		libpq_append_conn_error(conn, "XPC service did not provide a valid socket descriptor");
+		return PGINVALID_SOCKET;
+	}
+
+	if (!pg_set_noblock(fd))
+	{
+		libpq_append_conn_error(conn, "could not set non-blocking mode on XPC socket: %s", strerror(errno));
+		closesocket(fd);
+		return PGINVALID_SOCKET;
+	}
+
+	return (pgsocket) fd;
+}
+#endif
+
 /* ----------------
  *		PQconnectPoll
  *
@@ -3120,16 +3225,36 @@ keep_going:						/* We will come back to here until there is
 					goto keep_going;
 				}
 				break;
+
+			case CHT_XPC_SERVICE:
+				conn->naddr = 1;
+				conn->whichaddr = 0;
+				conn->addr = calloc(1, sizeof(AddrInfo));
+				if (!conn->addr)
+				{
+					libpq_append_conn_error(conn, "out of memory");
+					goto error_return;
+				}
+				conn->addr[0].family = AF_UNIX;
+				conn->addr[0].addr.addr.ss_family = AF_UNIX;
+				conn->addr[0].addr.salen = sizeof(struct sockaddr_un);
+				reset_connection_state_machine = true;
+				conn->try_next_host = false;
+				addrlist = NULL;
+				break;
 		}
 
-		/*
-		 * Store a copy of the addrlist in private memory so we can perform
-		 * randomization for load balancing.
-		 */
-		ret = store_conn_addrinfo(conn, addrlist);
-		pg_freeaddrinfo_all(hint.ai_family, addrlist);
-		if (ret)
-			goto error_return;	/* message already logged */
+		if (ch->type != CHT_XPC_SERVICE)
+		{
+			/*
+			 * Store a copy of the addrlist in private memory so we can perform
+			 * randomization for load balancing.
+			 */
+			ret = store_conn_addrinfo(conn, addrlist);
+			pg_freeaddrinfo_all(hint.ai_family, addrlist);
+			if (ret)
+				goto error_return;	/* message already logged */
+		}
 
 		/*
 		 * If random load balancing is enabled we shuffle the addresses.
@@ -3318,6 +3443,34 @@ keep_going:						/* We will come back to here until there is
 					getHostaddr(conn, host_addr, NI_MAXHOST);
 					if (host_addr[0])
 						conn->connip = strdup(host_addr);
+
+					{
+						pg_conn_host *ch = &conn->connhost[conn->whichhost];
+
+						if (ch->type == CHT_XPC_SERVICE)
+						{
+#ifdef USE_XPC
+							conn->sock = pqConnectXPC(conn, ch->host);
+							if (conn->sock == PGINVALID_SOCKET)
+							{
+								conn->try_next_host = true;
+								goto keep_going;
+							}
+							conn->sigpipe_so = false;
+#ifdef SO_NOSIGPIPE
+							optval = 1;
+							if (setsockopt(conn->sock, SOL_SOCKET, SO_NOSIGPIPE,
+										   (char *) &optval, sizeof(optval)) == 0)
+								conn->sigpipe_so = true;
+#endif
+							conn->status = CONNECTION_STARTED;
+							goto keep_going;
+#else
+							libpq_append_conn_error(conn, "macOS XPC connections are not supported on this platform");
+							goto error_return;
+#endif
+						}
+					}
 
 					/* Try to create the socket */
 					sock_type = SOCK_STREAM;
@@ -5127,6 +5280,7 @@ freePGconn(PGconn *conn)
 	free(conn->scram_client_key);
 	free(conn->scram_server_key);
 	free(conn->sslkeylogfile);
+	free(conn->xpc_service);
 	free(conn->oauth_issuer);
 	free(conn->oauth_issuer_id);
 	free(conn->oauth_discovery_uri);
@@ -7655,6 +7809,14 @@ PQoptions(const PGconn *conn)
 	if (!conn)
 		return NULL;
 	return conn->pgoptions;
+}
+
+char *
+PQxpcService(const PGconn *conn)
+{
+	if (!conn)
+		return NULL;
+	return conn->xpc_service;
 }
 
 ConnStatusType

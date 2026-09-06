@@ -1047,6 +1047,12 @@
   boot_val => 'true',
 },
 
+{ name => 'enable_xpc', type => 'bool', context => 'PGC_POSTMASTER', group => 'CONN_AUTH_SETTINGS',
+  short_desc => 'Enables macOS XPC service listening.',
+  variable => 'enable_xpc',
+  boot_val => 'false',
+},
+
 { name => 'event_source', type => 'string', context => 'PGC_POSTMASTER', group => 'LOGGING_WHERE',
   short_desc => 'Sets the application name used to identify PostgreSQL messages in the event log.',
   variable => 'event_source',
@@ -3665,6 +3671,30 @@
   variable => 'xmloption',
   boot_val => 'XMLOPTION_CONTENT',
   options => 'xmloption_options',
+},
+
+{ name => 'xpc_client_bundleid', type => 'string', context => 'PGC_POSTMASTER', group => 'CONN_AUTH_AUTH',
+  short_desc => 'Sets the required Bundle ID for XPC clients.',
+  variable => 'xpc_client_bundleid',
+  boot_val => '""',
+},
+
+{ name => 'xpc_client_requirement', type => 'string', context => 'PGC_POSTMASTER', group => 'CONN_AUTH_AUTH',
+  short_desc => 'Sets the Code Signing Requirement expression for XPC clients.',
+  variable => 'xpc_client_requirement',
+  boot_val => '""',
+},
+
+{ name => 'xpc_client_teamid', type => 'string', context => 'PGC_POSTMASTER', group => 'CONN_AUTH_AUTH',
+  short_desc => 'Sets the required Apple Team ID for XPC clients.',
+  variable => 'xpc_client_teamid',
+  boot_val => '""',
+},
+
+{ name => 'xpc_service_name', type => 'string', context => 'PGC_POSTMASTER', group => 'CONN_AUTH_SETTINGS',
+  short_desc => 'Sets the macOS XPC Mach service name.',
+  variable => 'xpc_service_name',
+  boot_val => '""',
 },
 
 { name => 'zero_damaged_pages', type => 'bool', context => 'PGC_SUSET', group => 'DEVELOPER_OPTIONS',
