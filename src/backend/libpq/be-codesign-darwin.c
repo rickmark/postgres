@@ -269,16 +269,31 @@ pg_codesign_verify_peer(int sock, const char *reqtext,
 	}
 
 	/*
-	 * A team identifier is absent for Apple platform binaries and for ad-hoc
-	 * signed code; that is not an error here.  Callers decide whether an
-	 * identity can be formed without one.
+	 * A team identifier is present for third-party developer-signed code.
+	 * For Apple platform binaries and ad-hoc signed code, synthesize "apple"
+	 * and "adhoc" respectively.
 	 */
-	if (CFDictionaryGetValue(info, kSecCodeInfoTeamIdentifier) != NULL &&
-		!cfstring_to_buf(CFDictionaryGetValue(info, kSecCodeInfoTeamIdentifier),
-						 peer->teamid, sizeof(peer->teamid)))
+	if (CFDictionaryGetValue(info, kSecCodeInfoTeamIdentifier) != NULL)
 	{
-		snprintf(errbuf, errlen, "peer has an over-long team identifier");
-		goto done;
+		if (!cfstring_to_buf(CFDictionaryGetValue(info, kSecCodeInfoTeamIdentifier),
+							 peer->teamid, sizeof(peer->teamid)))
+		{
+			snprintf(errbuf, errlen, "peer has an over-long team identifier");
+			goto done;
+		}
+	}
+	else
+	{
+		CFNumberRef flagsNum = CFDictionaryGetValue(info, kSecCodeInfoFlags);
+		uint32_t	flags = 0;
+
+		if (flagsNum != NULL)
+			CFNumberGetValue(flagsNum, kCFNumberSInt32Type, &flags);
+
+		if ((flags & kSecCodeSignatureAdhoc) != 0)
+			snprintf(peer->teamid, sizeof(peer->teamid), "adhoc");
+		else
+			snprintf(peer->teamid, sizeof(peer->teamid), "apple");
 	}
 
 	result = 0;

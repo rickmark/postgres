@@ -44,8 +44,8 @@ typedef struct pg_codesign_peer
 	char		identifier[PG_CODESIGN_ID_MAXLEN];
 
 	/*
-	 * Team identifier, e.g. "ABCDE12345".  Empty if the peer has none, which
-	 * is the case for Apple platform binaries and ad-hoc signed code.
+	 * Team identifier, e.g. "ABCDE12345", "apple" for Apple platform binaries,
+	 * or "adhoc" for ad-hoc signed code.  Never empty on success.
 	 */
 	char		teamid[PG_CODESIGN_ID_MAXLEN];
 } pg_codesign_peer;

@@ -84,8 +84,8 @@ typedef enum ClientCertName
  */
 typedef enum CodesignIdentity
 {
-	codesignIdFull,				/* "TEAMID/identifier", or "-/identifier" */
-	codesignIdTeam,				/* "TEAMID" */
+	codesignIdFull,				/* "TEAMID/identifier", "apple/identifier", or "adhoc/identifier" */
+	codesignIdTeam,				/* "TEAMID", "apple", or "adhoc" */
 	codesignIdIdentifier,		/* "identifier" */
 } CodesignIdentity;
 

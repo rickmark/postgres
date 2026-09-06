@@ -2033,31 +2033,10 @@ auth_codesign(Port *port)
 	switch (port->hba->codesign_identity)
 	{
 		case codesignIdFull:
-
-			/*
-			 * Apple platform binaries and ad-hoc signed code carry no team
-			 * identifier; "-" stands in for it, matching how codesign(1)
-			 * displays an absent team.
-			 */
-			identity = psprintf("%s/%s",
-								peer.teamid[0] != '\0' ? peer.teamid : "-",
-								peer.identifier);
+			identity = psprintf("%s/%s", peer.teamid, peer.identifier);
 			break;
 
 		case codesignIdTeam:
-
-			/*
-			 * Refuse rather than invent an identity: a rule written in terms
-			 * of a team must not be satisfiable by code that has no team.
-			 */
-			if (peer.teamid[0] == '\0')
-			{
-				ereport(LOG,
-						(errcode(ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION),
-						 errmsg("code signature authentication failed: peer \"%s\" has no team identifier",
-								peer.identifier)));
-				return STATUS_ERROR;
-			}
 			identity = pstrdup(peer.teamid);
 			break;
 
@@ -2109,7 +2088,7 @@ check_codesign_requirement(Port *port)
 		ereport(LOG,
 				errmsg("connection satisfied code signing requirement: identifier=\"%s\" team=\"%s\" (%s:%d)",
 					   peer.identifier,
-					   peer.teamid[0] != '\0' ? peer.teamid : "-",
+					   peer.teamid,
 					   port->hba->sourcefile, port->hba->linenumber));
 }
 
