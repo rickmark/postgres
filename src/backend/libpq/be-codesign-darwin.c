@@ -311,3 +311,81 @@ done:
 
 	return result;
 }
+
+/*
+ * Obtain the team identifier of the executing binary (this process).
+ *
+ * Caches the result in a static buffer once retrieved so that subsequent
+ * calls avoid redundant queries.
+ */
+int
+pg_codesign_get_own_teamid(char *own_teamid, size_t own_teamid_len,
+						   char *errbuf, size_t errlen)
+{
+	static char cached_teamid[PG_CODESIGN_ID_MAXLEN] = "";
+	static bool cached = false;
+	SecCodeRef	self = NULL;
+	CFDictionaryRef info = NULL;
+	OSStatus	status;
+	int			result = -1;
+
+	if (cached)
+	{
+		snprintf(own_teamid, own_teamid_len, "%s", cached_teamid);
+		return 0;
+	}
+
+	status = SecCodeCopySelf(kSecCSDefaultFlags, &self);
+	if (status != errSecSuccess)
+	{
+		report_osstatus(errbuf, errlen, "could not identify server code",
+						status, NULL);
+		return -1;
+	}
+
+	status = SecCodeCopySigningInformation((SecStaticCodeRef) self,
+										   kSecCSSigningInformation, &info);
+	if (status != errSecSuccess)
+	{
+		report_osstatus(errbuf, errlen,
+						"could not read server code signing information",
+						status, NULL);
+		CFRelease(self);
+		return -1;
+	}
+
+	if (CFDictionaryGetValue(info, kSecCodeInfoTeamIdentifier) != NULL)
+	{
+		if (!cfstring_to_buf(CFDictionaryGetValue(info, kSecCodeInfoTeamIdentifier),
+							 cached_teamid, sizeof(cached_teamid)))
+		{
+			snprintf(errbuf, errlen, "server has an over-long team identifier");
+			goto done;
+		}
+	}
+	else
+	{
+		CFNumberRef flagsNum = CFDictionaryGetValue(info, kSecCodeInfoFlags);
+		uint32_t	flags = 0;
+
+		if (flagsNum != NULL)
+			CFNumberGetValue(flagsNum, kCFNumberSInt32Type, &flags);
+
+		if ((flags & kSecCodeSignatureAdhoc) != 0)
+			snprintf(cached_teamid, sizeof(cached_teamid), "adhoc");
+		else
+			snprintf(cached_teamid, sizeof(cached_teamid), "apple");
+	}
+
+	cached = true;
+	snprintf(own_teamid, own_teamid_len, "%s", cached_teamid);
+	result = 0;
+
+done:
+	if (info != NULL)
+		CFRelease(info);
+	if (self != NULL)
+		CFRelease(self);
+
+	return result;
+}

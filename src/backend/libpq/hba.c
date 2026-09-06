@@ -3042,6 +3042,22 @@ check_usermap(const char *usermap_name,
 			if (strcmp(pg_user, system_user) == 0)
 				return STATUS_OK;
 		}
+#ifdef USE_DARWIN_CODESIGN
+		if (strcmp(pg_user, "same") == 0)
+		{
+			char		own_teamid[PG_CODESIGN_ID_MAXLEN];
+			char		errbuf[PG_CODESIGN_ERR_MAXLEN];
+
+			if (pg_codesign_get_own_teamid(own_teamid, sizeof(own_teamid),
+										   errbuf, sizeof(errbuf)) == 0)
+			{
+				if (case_insensitive ?
+					pg_strcasecmp(system_user, own_teamid) == 0 :
+					strcmp(system_user, own_teamid) == 0)
+					return STATUS_OK;
+			}
+		}
+#endif
 		ereport(LOG,
 				(errmsg("provided user name (%s) and authenticated user name (%s) do not match",
 						pg_user, system_user)));
@@ -3050,15 +3066,43 @@ check_usermap(const char *usermap_name,
 	else
 	{
 		ListCell   *line_cell;
+#ifdef USE_DARWIN_CODESIGN
+		char		own_teamid[PG_CODESIGN_ID_MAXLEN];
+		char		errbuf[PG_CODESIGN_ERR_MAXLEN];
+		char	   *same_system_user = NULL;
+
+		if (pg_codesign_get_own_teamid(own_teamid, sizeof(own_teamid),
+									   errbuf, sizeof(errbuf)) == 0)
+		{
+			size_t		own_len = strlen(own_teamid);
+
+			if (strcmp(system_user, own_teamid) == 0)
+				same_system_user = pstrdup("same");
+			else if (strncmp(system_user, own_teamid, own_len) == 0 &&
+					 system_user[own_len] == '/')
+				same_system_user = psprintf("same%s", system_user + own_len);
+		}
+#endif
 
 		foreach(line_cell, parsed_ident_lines)
 		{
 			check_ident_usermap(lfirst(line_cell), usermap_name,
 								pg_user, system_user, case_insensitive,
 								&found_entry, &error);
+#ifdef USE_DARWIN_CODESIGN
+			if (!found_entry && !error && same_system_user != NULL)
+				check_ident_usermap(lfirst(line_cell), usermap_name,
+									pg_user, same_system_user, case_insensitive,
+									&found_entry, &error);
+#endif
 			if (found_entry || error)
 				break;
 		}
+
+#ifdef USE_DARWIN_CODESIGN
+		if (same_system_user != NULL)
+			pfree(same_system_user);
+#endif
 	}
 	if (!found_entry && !error)
 	{

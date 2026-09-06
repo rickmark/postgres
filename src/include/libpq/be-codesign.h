@@ -45,10 +45,24 @@ typedef struct pg_codesign_peer
 
 	/*
 	 * Team identifier, e.g. "ABCDE12345", "apple" for Apple platform binaries,
-	 * or "adhoc" for ad-hoc signed code.  Never empty on success.
+	 * or "adhoc" for ad-hoc signed code.  Never empty on success.  In usermaps,
+	 * "same" can also be specified to match the executing binary's team identifier.
 	 */
 	char		teamid[PG_CODESIGN_ID_MAXLEN];
 } pg_codesign_peer;
+
+/*
+ * Obtain the team identifier of the executing binary (this process).
+ *
+ * Stores "apple" for Apple platform binaries, "adhoc" for ad-hoc signed code,
+ * or the developer team identifier (e.g. "ABCDE12345") in own_teamid, which
+ * must be at least PG_CODESIGN_ID_MAXLEN bytes.
+ *
+ * Returns 0 on success.  On failure, returns -1 and writes a message
+ * describing the problem into errbuf, which must be at least errlen bytes.
+ */
+extern int	pg_codesign_get_own_teamid(char *own_teamid, size_t own_teamid_len,
+									  char *errbuf, size_t errlen);
 
 /*
  * Check that "reqtext" is a syntactically valid code signing requirement,
