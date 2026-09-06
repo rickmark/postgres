@@ -29,6 +29,7 @@
 #include "catalog/pg_collation.h"
 #include "common/ip.h"
 #include "common/string.h"
+#include "libpq/be-codesign.h"
 #include "libpq/hba.h"
 #include "libpq/ifaddr.h"
 #include "libpq/libpq-be.h"
@@ -116,6 +117,7 @@ static const char *const UserAuthName[] =
 	"cert",
 	"peer",
 	"oauth",
+	"codesign",
 };
 
 /*
@@ -1745,6 +1747,12 @@ parse_hba_line(TokenizedAuthLine *tok_line, int elevel)
 #endif
 	else if (strcmp(token->string, "oauth") == 0)
 		parsedline->auth_method = uaOAuth;
+	else if (strcmp(token->string, "codesign") == 0)
+#ifdef USE_DARWIN_CODESIGN
+		parsedline->auth_method = uaCodesign;
+#else
+		unsupauth = "codesign";
+#endif
 	else
 	{
 		ereport(elevel,
@@ -1801,6 +1809,18 @@ parse_hba_line(TokenizedAuthLine *tok_line, int elevel)
 				 errcontext("line %d of configuration file \"%s\"",
 							line_num, file_name)));
 		*err_msg = "peer authentication is only supported on local sockets";
+		return NULL;
+	}
+
+	if (parsedline->conntype != ctLocal &&
+		parsedline->auth_method == uaCodesign)
+	{
+		ereport(elevel,
+				(errcode(ERRCODE_CONFIG_FILE_ERROR),
+				 errmsg("codesign authentication is only supported on local sockets"),
+				 errcontext("line %d of configuration file \"%s\"",
+							line_num, file_name)));
+		*err_msg = "codesign authentication is only supported on local sockets";
 		return NULL;
 	}
 
@@ -1986,9 +2006,137 @@ parse_hba_line(TokenizedAuthLine *tok_line, int elevel)
 		}
 	}
 
+	/*
+	 * Enforce proper configuration of code signature authentication.  A
+	 * requirement is mandatory: without one the method would accept any peer,
+	 * including unsigned code, which would be worse than useless.
+	 */
+	if (parsedline->auth_method == uaCodesign)
+	{
+		MANDATORY_AUTH_ARG(parsedline->codesign_requirement,
+						   "codesign_requirement", "codesign");
+	}
+
 	return parsedline;
 }
 
+#ifdef USE_DARWIN_CODESIGN
+/*
+ * Read a code signing requirement from the file "filename".
+ *
+ * The file is taken verbatim apart from surrounding whitespace, so a
+ * requirement may be spread over several lines.  The requirement language has
+ * no comment syntax, and inventing one here could change the meaning of a
+ * requirement containing that character inside a string, so none is applied.
+ *
+ * Returns the requirement on success.  On failure, reports the problem at
+ * level elevel, stores a message into *err_msg, and returns NULL.
+ */
+static char *
+read_codesign_requirement_file(const char *filename, int elevel,
+							   char **err_msg)
+{
+	FILE	   *file;
+	StringInfoData buf;
+	char		chunk[1024];
+	size_t		nread;
+
+	if (!is_absolute_path(filename))
+	{
+		ereport(elevel,
+				(errcode(ERRCODE_CONFIG_FILE_ERROR),
+				 errmsg("codesign requirement file path \"%s\" is not absolute",
+						filename)));
+		*err_msg = psprintf("codesign requirement file path \"%s\" is not absolute",
+							filename);
+		return NULL;
+	}
+
+	file = AllocateFile(filename, "r");
+	if (file == NULL)
+	{
+		int			save_errno = errno;
+
+		ereport(elevel,
+				(errcode_for_file_access(),
+				 errmsg("could not open codesign requirement file \"%s\": %m",
+						filename)));
+		errno = save_errno;
+		*err_msg = psprintf("could not open codesign requirement file \"%s\": %m",
+							filename);
+		return NULL;
+	}
+
+	initStringInfo(&buf);
+	while ((nread = fread(chunk, 1, sizeof(chunk), file)) > 0)
+		appendBinaryStringInfo(&buf, chunk, (int) nread);
+
+	if (ferror(file))
+	{
+		int			save_errno = errno;
+
+		ereport(elevel,
+				(errcode_for_file_access(),
+				 errmsg("could not read codesign requirement file \"%s\": %m",
+						filename)));
+		errno = save_errno;
+		*err_msg = psprintf("could not read codesign requirement file \"%s\": %m",
+							filename);
+		FreeFile(file);
+		pfree(buf.data);
+		return NULL;
+	}
+
+	FreeFile(file);
+
+	/* Trim surrounding whitespace, including the customary trailing newline */
+	while (buf.len > 0 && isspace((unsigned char) buf.data[buf.len - 1]))
+		buf.data[--buf.len] = '\0';
+
+	if (buf.len == 0 || strlen(buf.data) != (size_t) buf.len)
+	{
+		/*
+		 * An embedded NUL would silently truncate the requirement, so treat it
+		 * the same way as an empty file rather than honouring a prefix of what
+		 * the administrator wrote.
+		 */
+		ereport(elevel,
+				(errcode(ERRCODE_CONFIG_FILE_ERROR),
+				 errmsg("codesign requirement file \"%s\" is empty or contains a null byte",
+						filename)));
+		*err_msg = psprintf("codesign requirement file \"%s\" is empty or contains a null byte",
+							filename);
+		pfree(buf.data);
+		return NULL;
+	}
+
+	return buf.data;
+}
+
+/*
+ * Check that a code signing requirement is syntactically valid, so that a
+ * typo is reported when the file is loaded rather than when a client first
+ * tries to connect.
+ */
+static bool
+validate_codesign_requirement(const char *reqtext, const char *optname,
+							  int line_num, const char *file_name,
+							  int elevel, char **err_msg)
+{
+	char		detail[PG_CODESIGN_ERR_MAXLEN];
+
+	if (pg_codesign_check_requirement(reqtext, detail, sizeof(detail)) == 0)
+		return true;
+
+	ereport(elevel,
+			(errcode(ERRCODE_CONFIG_FILE_ERROR),
+			 errmsg("invalid value for %s: %s", optname, detail),
+			 errcontext("line %d of configuration file \"%s\"",
+						line_num, file_name)));
+	*err_msg = psprintf("invalid value for %s: %s", optname, detail);
+	return false;
+}
+#endif							/* USE_DARWIN_CODESIGN */
 
 /*
  * Parse one name-value pair as an authentication option into the given
@@ -2014,8 +2162,9 @@ parse_hba_auth_opt(char *name, char *val, HbaLine *hbaline,
 			hbaline->auth_method != uaGSS &&
 			hbaline->auth_method != uaSSPI &&
 			hbaline->auth_method != uaCert &&
-			hbaline->auth_method != uaOAuth)
-			INVALID_AUTH_OPTION("map", gettext_noop("ident, peer, gssapi, sspi, cert, and oauth"));
+			hbaline->auth_method != uaOAuth &&
+			hbaline->auth_method != uaCodesign)
+			INVALID_AUTH_OPTION("map", gettext_noop("ident, peer, gssapi, sspi, cert, oauth, and codesign"));
 		hbaline->usermap = pstrdup(val);
 	}
 	else if (strcmp(name, "clientcert") == 0)
@@ -2314,6 +2463,91 @@ parse_hba_auth_opt(char *name, char *val, HbaLine *hbaline,
 			hbaline->oauth_skip_usermap = true;
 		else
 			hbaline->oauth_skip_usermap = false;
+	}
+	else if (strcmp(name, "codesign_requirement") == 0 ||
+			 strcmp(name, "codesign_requirement_file") == 0)
+	{
+#ifdef USE_DARWIN_CODESIGN
+		char	   *reqtext;
+
+		/*
+		 * A peer's code signature can only be obtained from the kernel for a
+		 * Unix-domain connection, so this is meaningless elsewhere.
+		 */
+		if (hbaline->conntype != ctLocal)
+		{
+			ereport(elevel,
+					(errcode(ERRCODE_CONFIG_FILE_ERROR),
+					 errmsg("%s can only be configured for \"local\" rows",
+							name),
+					 errcontext("line %d of configuration file \"%s\"",
+								line_num, file_name)));
+			*err_msg = psprintf("%s can only be configured for \"local\" rows",
+								name);
+			return false;
+		}
+
+		if (hbaline->codesign_requirement != NULL)
+		{
+			ereport(elevel,
+					(errcode(ERRCODE_CONFIG_FILE_ERROR),
+			/* translator: strings are replaced with hba options */
+					 errmsg("%s cannot be used in combination with %s",
+							"codesign_requirement",
+							"codesign_requirement_file"),
+					 errcontext("line %d of configuration file \"%s\"",
+								line_num, file_name)));
+			*err_msg = "codesign_requirement cannot be used in combination with codesign_requirement_file";
+			return false;
+		}
+
+		if (strcmp(name, "codesign_requirement_file") == 0)
+		{
+			reqtext = read_codesign_requirement_file(val, elevel, err_msg);
+			if (reqtext == NULL)
+				return false;	/* error already reported */
+		}
+		else
+			reqtext = pstrdup(val);
+
+		if (!validate_codesign_requirement(reqtext, name, line_num, file_name,
+										   elevel, err_msg))
+			return false;		/* error already reported */
+
+		hbaline->codesign_requirement = reqtext;
+#else
+		ereport(elevel,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("%s is not supported on this platform", name),
+				 errcontext("line %d of configuration file \"%s\"",
+							line_num, file_name)));
+		*err_msg = psprintf("%s is not supported on this platform", name);
+		return false;
+#endif							/* USE_DARWIN_CODESIGN */
+	}
+	else if (strcmp(name, "codesign_identity") == 0)
+	{
+		REQUIRE_AUTH_OPTION(uaCodesign, "codesign_identity", "codesign");
+
+		if (strcmp(val, "full") == 0)
+			hbaline->codesign_identity = codesignIdFull;
+		else if (strcmp(val, "team") == 0)
+			hbaline->codesign_identity = codesignIdTeam;
+		else if (strcmp(val, "identifier") == 0)
+			hbaline->codesign_identity = codesignIdIdentifier;
+		else
+		{
+			ereport(elevel,
+					(errcode(ERRCODE_CONFIG_FILE_ERROR),
+					 errmsg("invalid value for codesign_identity: \"%s\"",
+							val),
+					 errhint("Valid values are \"full\", \"team\", and \"identifier\"."),
+					 errcontext("line %d of configuration file \"%s\"",
+								line_num, file_name)));
+			*err_msg = psprintf("invalid value for codesign_identity: \"%s\"",
+								val);
+			return false;
+		}
 	}
 	else
 	{

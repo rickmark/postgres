@@ -301,6 +301,13 @@ elif host_system == 'darwin'
   # depend on the same library. Quiesce the ill considered warning.
   ldflags += cc.get_supported_link_arguments('-Wl,-no_warn_duplicate_libraries')
 
+  # Code signature authentication for peers of Unix-domain connections.  These
+  # frameworks are part of every macOS, so no option gates this; only the
+  # backend links them.
+  cdata.set('USE_DARWIN_CODESIGN', 1)
+  backend_deps += dependency('appleframeworks',
+    modules: ['Security', 'CoreFoundation'], required: true)
+
 elif host_system == 'freebsd'
   sema_kind = 'unnamed_posix'
 

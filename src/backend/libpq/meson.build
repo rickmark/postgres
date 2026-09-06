@@ -28,6 +28,10 @@ if gssapi.found()
   )
 endif
 
+if host_system == 'darwin'
+  backend_sources += files('be-codesign-darwin.c')
+endif
+
 install_data(
   'pg_hba.conf.sample',
   'pg_ident.conf.sample',

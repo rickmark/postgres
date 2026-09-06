@@ -39,7 +39,8 @@ typedef enum UserAuth
 	uaCert,
 	uaPeer,
 	uaOAuth,
-#define USER_AUTH_LAST uaOAuth	/* Must be last value of this enum */
+	uaCodesign,
+#define USER_AUTH_LAST uaCodesign	/* Must be last value of this enum */
 } UserAuth;
 
 /*
@@ -76,6 +77,17 @@ typedef enum ClientCertName
 	clientCertCN,
 	clientCertDN,
 } ClientCertName;
+
+/*
+ * Which part of a peer's code signing identity is used as its authenticated
+ * identity by the "codesign" method.
+ */
+typedef enum CodesignIdentity
+{
+	codesignIdFull,				/* "TEAMID/identifier", or "-/identifier" */
+	codesignIdTeam,				/* "TEAMID" */
+	codesignIdIdentifier,		/* "identifier" */
+} CodesignIdentity;
 
 /*
  * A single string token lexed from an authentication configuration file
@@ -133,6 +145,15 @@ typedef struct HbaLine
 	bool		oauth_skip_usermap;
 	List	   *oauth_opt_keys;
 	List	   *oauth_opt_vals;
+
+	/*
+	 * Code signing requirement that the peer of a local connection must
+	 * satisfy.  When auth_method is uaCodesign this is mandatory and also
+	 * yields the authenticated identity; on any other local method it acts
+	 * purely as a gate checked before that method runs.
+	 */
+	char	   *codesign_requirement;
+	CodesignIdentity codesign_identity;
 } HbaLine;
 
 typedef struct IdentLine

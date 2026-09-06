@@ -39,12 +39,12 @@ static void fill_ident_view(Tuplestorestate *tuple_store, TupleDesc tupdesc);
 /*
  * This macro specifies the maximum number of authentication options
  * that are possible with any given authentication method that is supported.
- * Currently LDAP supports 12, and there are 3 that are not dependent on
+ * Currently LDAP supports 12, and there are 5 that are not dependent on
  * the auth method here.  It may not actually be possible to set all of them
  * at the same time, but we'll set the macro value high enough to be
  * conservative and avoid warnings from static analysis tools.
  */
-#define MAX_HBA_OPTIONS 15
+#define MAX_HBA_OPTIONS 17
 
 /*
  * Create a text array listing the options specified in the HBA line.
@@ -152,6 +152,38 @@ get_hba_options(HbaLine *hba)
 		if (hba->oauth_skip_usermap)
 			options[noptions++] =
 				CStringGetTextDatum(psprintf("delegate_ident_mapping=true"));
+	}
+
+	/*
+	 * A code signing requirement may be attached to any local line, not just
+	 * one using the "codesign" method, so this is not conditional on
+	 * auth_method.  It is reported under the inline option name whether it was
+	 * written inline or read from a file.
+	 */
+	if (hba->codesign_requirement)
+		options[noptions++] =
+			CStringGetTextDatum(psprintf("codesign_requirement=%s",
+										 hba->codesign_requirement));
+
+	if (hba->auth_method == uaCodesign)
+	{
+		const char *identity = "full";
+
+		switch (hba->codesign_identity)
+		{
+			case codesignIdFull:
+				identity = "full";
+				break;
+			case codesignIdTeam:
+				identity = "team";
+				break;
+			case codesignIdIdentifier:
+				identity = "identifier";
+				break;
+		}
+
+		options[noptions++] =
+			CStringGetTextDatum(psprintf("codesign_identity=%s", identity));
 	}
 
 	/* If you add more options, consider increasing MAX_HBA_OPTIONS. */

@@ -27,6 +27,7 @@
 #include "common/ip.h"
 #include "common/md5.h"
 #include "libpq/auth.h"
+#include "libpq/be-codesign.h"
 #include "libpq/crypt.h"
 #include "libpq/libpq.h"
 #include "libpq/oauth.h"
@@ -81,6 +82,16 @@ static int	ident_inet(Port *port);
  *----------------------------------------------------------------
  */
 static int	auth_peer(Port *port);
+
+
+/*----------------------------------------------------------------
+ * Code signature authentication
+ *----------------------------------------------------------------
+ */
+#ifdef USE_DARWIN_CODESIGN
+static int	auth_codesign(Port *port);
+static void check_codesign_requirement(Port *port);
+#endif
 
 
 /*----------------------------------------------------------------
@@ -297,6 +308,9 @@ auth_failed(Port *port, int elevel, int status, const char *logdetail)
 		case uaOAuth:
 			errstr = gettext_noop("OAuth bearer authentication failed for user \"%s\"");
 			break;
+		case uaCodesign:
+			errstr = gettext_noop("code signature authentication failed for user \"%s\"");
+			break;
 		default:
 			errstr = gettext_noop("authentication failed for user \"%s\": invalid authentication method");
 			break;
@@ -421,6 +435,21 @@ ClientAuthentication(Port *port)
 					(errcode(ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION),
 					 errmsg("connection requires a valid client certificate")));
 	}
+
+#ifdef USE_DARWIN_CODESIGN
+
+	/*
+	 * When a code signing requirement is attached to a line whose method is
+	 * something other than "codesign", it acts purely as a gate on the
+	 * connecting program.  Check it before running that method, so that an
+	 * untrusted binary is never even prompted for a password.  For the
+	 * "codesign" method itself the requirement is part of authenticating, and
+	 * auth_codesign() checks it instead.
+	 */
+	if (port->hba->codesign_requirement != NULL &&
+		port->hba->auth_method != uaCodesign)
+		check_codesign_requirement(port);
+#endif
 
 	/*
 	 * Now proceed to do the actual authentication check
@@ -630,6 +659,14 @@ ClientAuthentication(Port *port)
 		case uaOAuth:
 			status = CheckSASLAuth(&pg_be_oauth_mech, port, NULL, &logdetail,
 								   &abandoned);
+			break;
+
+		case uaCodesign:
+#ifdef USE_DARWIN_CODESIGN
+			status = auth_codesign(port);
+#else
+			Assert(false);
+#endif
 			break;
 	}
 
@@ -1959,6 +1996,124 @@ auth_peer(Port *port)
 	return STATUS_ERROR;
 #endif
 }
+
+
+/*----------------------------------------------------------------
+ * Code signature authentication system
+ *----------------------------------------------------------------
+ */
+#ifdef USE_DARWIN_CODESIGN
+
+/*
+ *	Validate the code signature of the connecting process against the code
+ *	signing requirement of the matched hba line, and use its signing identity
+ *	as the authenticated identity, subject to the usermap.
+ *
+ *	Iff authorized, return STATUS_OK, otherwise return STATUS_ERROR.
+ */
+static int
+auth_codesign(Port *port)
+{
+	pg_codesign_peer peer;
+	char		errbuf[PG_CODESIGN_ERR_MAXLEN];
+	char	   *identity = NULL;
+
+	/* parse_hba_line() makes a requirement mandatory for this method */
+	Assert(port->hba->codesign_requirement != NULL);
+
+	if (pg_codesign_verify_peer(port->sock, port->hba->codesign_requirement,
+								&peer, errbuf, sizeof(errbuf)) != 0)
+	{
+		ereport(LOG,
+				(errcode(ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION),
+				 errmsg("code signature authentication failed: %s", errbuf)));
+		return STATUS_ERROR;
+	}
+
+	switch (port->hba->codesign_identity)
+	{
+		case codesignIdFull:
+
+			/*
+			 * Apple platform binaries and ad-hoc signed code carry no team
+			 * identifier; "-" stands in for it, matching how codesign(1)
+			 * displays an absent team.
+			 */
+			identity = psprintf("%s/%s",
+								peer.teamid[0] != '\0' ? peer.teamid : "-",
+								peer.identifier);
+			break;
+
+		case codesignIdTeam:
+
+			/*
+			 * Refuse rather than invent an identity: a rule written in terms
+			 * of a team must not be satisfiable by code that has no team.
+			 */
+			if (peer.teamid[0] == '\0')
+			{
+				ereport(LOG,
+						(errcode(ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION),
+						 errmsg("code signature authentication failed: peer \"%s\" has no team identifier",
+								peer.identifier)));
+				return STATUS_ERROR;
+			}
+			identity = pstrdup(peer.teamid);
+			break;
+
+		case codesignIdIdentifier:
+			identity = pstrdup(peer.identifier);
+			break;
+	}
+
+	Assert(identity != NULL);
+
+	/*
+	 * Set the authenticated identity before checking the usermap, because
+	 * authentication has already succeeded and we want the log file to
+	 * reflect that.
+	 */
+	set_authn_id(port, identity);
+
+	return check_usermap(port->hba->usermap, port->user_name,
+						 MyClientConnectionInfo.authn_id, false);
+}
+
+/*
+ *	Check the connecting process against the code signing requirement of the
+ *	matched hba line, used as a gate ahead of some other authentication
+ *	method.  Does not return if the peer fails the requirement.
+ *
+ *	Unlike auth_codesign(), this deliberately does not call set_authn_id():
+ *	the identity belongs to the authentication method that runs next.  The
+ *	validated code identity is logged instead, so that the gate is auditable.
+ */
+static void
+check_codesign_requirement(Port *port)
+{
+	pg_codesign_peer peer;
+	char		errbuf[PG_CODESIGN_ERR_MAXLEN];
+
+	Assert(port->hba->codesign_requirement != NULL);
+
+	if (pg_codesign_verify_peer(port->sock, port->hba->codesign_requirement,
+								&peer, errbuf, sizeof(errbuf)) != 0)
+		ereport(FATAL,
+				(errcode(ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION),
+				 errmsg("connection requires a program satisfying the configured code signing requirement"),
+				 errdetail_log("%s\nConnection matched file \"%s\" line %d: \"%s\"",
+							   errbuf, port->hba->sourcefile,
+							   port->hba->linenumber, port->hba->rawline)));
+
+	if (log_connections & LOG_CONNECTION_AUTHENTICATION)
+		ereport(LOG,
+				errmsg("connection satisfied code signing requirement: identifier=\"%s\" team=\"%s\" (%s:%d)",
+					   peer.identifier,
+					   peer.teamid[0] != '\0' ? peer.teamid : "-",
+					   port->hba->sourcefile, port->hba->linenumber));
+}
+
+#endif							/* USE_DARWIN_CODESIGN */
 
 
 /*----------------------------------------------------------------
