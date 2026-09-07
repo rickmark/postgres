@@ -16,7 +16,7 @@ my $svc_name = "org.postgresql.test.xpc." . $$;
 
 # Configure node with XPC enabled and NO TCP or unix socket
 $node->append_conf('postgresql.conf', qq{
-enable_xpc = on
+xpc = on
 xpc_service_name = '$svc_name'
 listen_addresses = ''
 unix_socket_directories = ''

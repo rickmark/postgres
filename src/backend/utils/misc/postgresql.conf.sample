@@ -76,6 +76,10 @@
                                         # (change requires restart)
 #bonjour_name = ''                      # defaults to the computer name
                                         # (change requires restart)
+#xpc = off                              # enable macOS XPC service
+                                        # (change requires restart)
+#xpc_service_name = ''                  # macOS XPC Mach service name
+                                        # (change requires restart)
 
 # - TCP settings -
 # see "man tcp" for details
@@ -101,6 +105,9 @@
 #password_expiration_warning_threshold = 7d  # threshold for expiration warnings
 #md5_password_warnings = on                  # display md5 deprecation warnings?
 #oauth_validator_libraries = '' # comma-separated list of trusted validator modules
+#xpc_client_bundleid = ''
+#xpc_client_requirement = ''
+#xpc_client_teamid = ''
 
 # GSSAPI using Kerberos
 #krb_server_keyfile = 'FILE:${sysconfdir}/krb5.keytab'
