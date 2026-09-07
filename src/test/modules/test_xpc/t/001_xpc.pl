@@ -26,6 +26,8 @@ $node->start;
 
 # 1. Test XPC ping action
 my ($stdout, $stderr) = run_command(['test_xpc', 'ping', $svc_name]);
+diag("ping stdout: $stdout");
+diag("ping stderr: $stderr");
 like($stdout, qr/STATUS: OK/, 'XPC ping returns OK status');
 like($stdout, qr/POSTMASTER_PID: \d+/, 'XPC ping returns valid postmaster PID');
 
@@ -49,10 +51,12 @@ like($stdout, qr/ROW: 1 foo/, 'XPC SELECT row 1 match');
 like($stdout, qr/ROW: 2 bar/, 'XPC SELECT row 2 match');
 
 # 4. Test libpq connection via xpc_service
-($stdout, $stderr) = run_command(['test_xpc', 'libpq', $svc_name, "SELECT id, val FROM test_xpc_items WHERE id = 2;"]);
-like($stdout, qr/LIBPQ_STATUS: OK/, 'libpq connection over XPC succeeds');
-like($stdout, qr/LIBPQ_XPC_SERVICE: \Q$svc_name\E/, 'PQxpcService accessor returns service name');
-like($stdout, qr/LIBPQ_ROW: 2 bar/, 'libpq query returns expected row');
+my ($lpq_stdout, $lpq_stderr) = run_command(['test_xpc', 'libpq', $svc_name, "SELECT id, val FROM test_xpc_items WHERE id = 2;"]);
+diag("libpq stdout: $lpq_stdout");
+diag("libpq stderr: $lpq_stderr");
+like($lpq_stdout, qr/LIBPQ_STATUS: OK/, 'libpq connection over XPC succeeds');
+like($lpq_stdout, qr/LIBPQ_XPC_SERVICE: \Q$svc_name\E/, 'PQxpcService accessor returns service name');
+like($lpq_stdout, qr/LIBPQ_ROW: 2 bar/, 'libpq query returns expected row');
 
 $node->stop;
 

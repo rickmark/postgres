@@ -36,6 +36,10 @@ char	   *xpc_client_requirement = NULL;
 
 #include <xpc/xpc.h>
 #include <dispatch/dispatch.h>
+#include <servers/bootstrap.h>
+#include <mach/mach.h>
+#include <pwd.h>
+#include <unistd.h>
 
 #define Size MacTypes_Size
 #include <CoreFoundation/CoreFoundation.h>
@@ -67,6 +71,7 @@ send_fd(int sock, int fd_to_send)
 		char		control[CMSG_SPACE(sizeof(int))];
 	}			control_un;
 	struct cmsghdr *cmptr;
+	int			res;
 
 	memset(&msg, 0, sizeof(msg));
 	iov.iov_base = &dummy;
@@ -83,7 +88,12 @@ send_fd(int sock, int fd_to_send)
 	cmptr->cmsg_type = SCM_RIGHTS;
 	*((int *) CMSG_DATA(cmptr)) = fd_to_send;
 
-	return sendmsg(sock, &msg, 0);
+	do
+	{
+		res = sendmsg(sock, &msg, 0);
+	} while (res < 0 && errno == EINTR);
+
+	return res;
 }
 
 /*
@@ -102,6 +112,7 @@ recv_fd(int sock)
 	}			control_un;
 	struct cmsghdr *cmptr;
 	int			received_fd = -1;
+	ssize_t		res;
 
 	memset(&msg, 0, sizeof(msg));
 	iov.iov_base = &dummy;
@@ -112,7 +123,12 @@ recv_fd(int sock)
 	msg.msg_control = control_un.control;
 	msg.msg_controllen = sizeof(control_un.control);
 
-	if (recvmsg(sock, &msg, 0) <= 0)
+	do
+	{
+		res = recvmsg(sock, &msg, 0);
+	} while (res < 0 && errno == EINTR);
+
+	if (res <= 0)
 		return -1;
 
 	cmptr = CMSG_FIRSTHDR(&msg);
@@ -384,6 +400,8 @@ execute_xpc_query(const char *query_str, const char *dbname, const char *usernam
 	char		command_tag[128] = "";
 	char		err_msg[512] = "";
 	bool		query_failed = false;
+	bool		got_ready = false;
+	char		default_user[128];
 
 	if (!query_str || query_str[0] == '\0')
 	{
@@ -392,8 +410,23 @@ execute_xpc_query(const char *query_str, const char *dbname, const char *usernam
 		return;
 	}
 
-	user = (username && username[0]) ? username : "postgres";
-	db = (dbname && dbname[0]) ? dbname : user;
+	if (username && username[0])
+		user = username;
+	else
+	{
+		struct passwd pw;
+		struct passwd *pwp = NULL;
+		char		pwbuf[512];
+
+		if (getpwuid_r(geteuid(), &pw, pwbuf, sizeof(pwbuf), &pwp) == 0 && pwp && pwp->pw_name)
+			strlcpy(default_user, pwp->pw_name, sizeof(default_user));
+		else if (getenv("USER"))
+			strlcpy(default_user, getenv("USER"), sizeof(default_user));
+		else
+			strlcpy(default_user, "postgres", sizeof(default_user));
+		user = default_user;
+	}
+	db = (dbname && dbname[0]) ? dbname : "postgres";
 
 	if (socketpair(AF_UNIX, SOCK_STREAM, 0, fds) != 0)
 	{
@@ -455,6 +488,7 @@ execute_xpc_query(const char *query_str, const char *dbname, const char *usernam
 			char		status_byte;
 
 			read_all(fds[1], &status_byte, 1);
+			got_ready = true;
 			break;
 		}
 		else if (msg_type == 'E')	/* ErrorResponse */
@@ -496,11 +530,11 @@ execute_xpc_query(const char *query_str, const char *dbname, const char *usernam
 		}
 	}
 
-	if (query_failed)
+	if (query_failed || !got_ready)
 	{
 		close(fds[1]);
 		xpc_dictionary_set_string(reply, "status", "ERROR");
-		xpc_dictionary_set_string(reply, "error_message", err_msg[0] ? err_msg : "startup failed");
+		xpc_dictionary_set_string(reply, "error_message", err_msg[0] ? err_msg : "backend connection closed during startup");
 		return;
 	}
 
@@ -513,9 +547,11 @@ execute_xpc_query(const char *query_str, const char *dbname, const char *usernam
 
 	if (!write_all(fds[1], buf, len + 6))
 	{
+		char		errbuf[128];
+		snprintf(errbuf, sizeof(errbuf), "failed to send query: errno=%d (%s)", errno, strerror(errno));
 		close(fds[1]);
 		xpc_dictionary_set_string(reply, "status", "ERROR");
-		xpc_dictionary_set_string(reply, "error_message", "failed to send query");
+		xpc_dictionary_set_string(reply, "error_message", errbuf);
 		return;
 	}
 
@@ -753,9 +789,6 @@ handle_xpc_peer_connection(xpc_connection_t peer)
 				return;
 			}
 
-			pg_set_noblock(fds[0]);
-			pg_set_noblock(fds[1]);
-
 			if (send_fd(pm_xpc_pipe[1], fds[0]) < 0)
 			{
 				close(fds[0]);
@@ -828,25 +861,8 @@ InitializeXPCService(void)
 				(errmsg("could not create socketpair for XPC communication: %m")));
 	}
 
-	pg_set_noblock(pm_xpc_pipe[0]);
-	pg_set_noblock(pm_xpc_pipe[1]);
-
 	xpc_queue = dispatch_queue_create("org.postgresql.xpc.listener", DISPATCH_QUEUE_SERIAL);
-
-	if (xpc_service_name && xpc_service_name[0] != '\0')
-	{
-		xpc_listener = xpc_connection_create_mach_service(xpc_service_name,
-														  xpc_queue,
-														  XPC_CONNECTION_MACH_SERVICE_LISTENER);
-		ereport(LOG,
-				(errmsg("starting macOS XPC service \"%s\"", xpc_service_name)));
-	}
-	else
-	{
-		xpc_listener = xpc_connection_create(NULL, xpc_queue);
-		ereport(LOG,
-				(errmsg("starting macOS XPC anonymous service")));
-	}
+	xpc_listener = xpc_connection_create(NULL, xpc_queue);
 
 	if (!xpc_listener)
 	{
@@ -864,6 +880,34 @@ InitializeXPCService(void)
 	});
 
 	xpc_connection_resume(xpc_listener);
+
+	if (xpc_service_name && xpc_service_name[0] != '\0')
+	{
+		xpc_endpoint_t ep = xpc_endpoint_create(xpc_listener);
+		mach_port_t ep_port = (ep != NULL) ? *((mach_port_t *) ((char *) ep + 0x18)) : MACH_PORT_NULL;
+		mach_port_t bp;
+		kern_return_t kr;
+
+		task_get_special_port(mach_task_self(), TASK_BOOTSTRAP_PORT, &bp);
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+		kr = bootstrap_register(bp, xpc_service_name, ep_port);
+#pragma clang diagnostic pop
+		if (kr != KERN_SUCCESS)
+		{
+			ereport(WARNING,
+					(errmsg("could not register XPC Mach service \"%s\" in bootstrap namespace: %d",
+							xpc_service_name, kr)));
+		}
+
+		ereport(LOG,
+				(errmsg("starting macOS XPC service \"%s\" (port=%u, kr=%d)", xpc_service_name, ep_port, kr)));
+	}
+	else
+	{
+		ereport(LOG,
+				(errmsg("starting macOS XPC anonymous service")));
+	}
 }
 
 /*
@@ -884,6 +928,8 @@ int
 AcceptXPCConnection(ClientSocket *client_sock)
 {
 	int			fd;
+
+	client_sock->sock = PGINVALID_SOCKET;
 
 	if (pm_xpc_pipe[0] < 0)
 		return STATUS_ERROR;
@@ -924,6 +970,17 @@ CloseXPCServiceInChild(void)
 void
 CloseXPCService(void)
 {
+	if (xpc_service_name && xpc_service_name[0] != '\0')
+	{
+		mach_port_t bp;
+
+		task_get_special_port(mach_task_self(), TASK_BOOTSTRAP_PORT, &bp);
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+		(void) bootstrap_register(bp, xpc_service_name, MACH_PORT_NULL);
+#pragma clang diagnostic pop
+	}
+
 	if (xpc_listener)
 	{
 		xpc_connection_cancel(xpc_listener);

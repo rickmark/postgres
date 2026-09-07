@@ -1276,104 +1276,106 @@ pqConnectOptions2(PGconn *conn)
 		conn->connhost[0].host = strdup(conn->xpc_service);
 		if (conn->connhost[0].host == NULL)
 			goto oom_error;
-		return true;
 	}
-	else if (conn->pghostaddr && conn->pghostaddr[0] != '\0')
-		conn->nconnhost = count_comma_separated_elems(conn->pghostaddr);
-	else if (conn->pghost && conn->pghost[0] != '\0')
-		conn->nconnhost = count_comma_separated_elems(conn->pghost);
 	else
-		conn->nconnhost = 1;
-	conn->connhost = (pg_conn_host *)
-		calloc(conn->nconnhost, sizeof(pg_conn_host));
-	if (conn->connhost == NULL)
-		goto oom_error;
-
-	/*
-	 * We now have one pg_conn_host structure per possible host.  Fill in the
-	 * host and hostaddr fields for each, by splitting the parameter strings.
-	 */
-	if (conn->pghostaddr != NULL && conn->pghostaddr[0] != '\0')
 	{
-		int			i;
-		char	   *s = conn->pghostaddr;
-		bool		more = true;
+		if (conn->pghostaddr && conn->pghostaddr[0] != '\0')
+			conn->nconnhost = count_comma_separated_elems(conn->pghostaddr);
+		else if (conn->pghost && conn->pghost[0] != '\0')
+			conn->nconnhost = count_comma_separated_elems(conn->pghost);
+		else
+			conn->nconnhost = 1;
+		conn->connhost = (pg_conn_host *)
+			calloc(conn->nconnhost, sizeof(pg_conn_host));
+		if (conn->connhost == NULL)
+			goto oom_error;
 
-		for (i = 0; i < conn->nconnhost && more; i++)
+		/*
+		 * We now have one pg_conn_host structure per possible host.  Fill in the
+		 * host and hostaddr fields for each, by splitting the parameter strings.
+		 */
+		if (conn->pghostaddr != NULL && conn->pghostaddr[0] != '\0')
 		{
-			conn->connhost[i].hostaddr = parse_comma_separated_list(&s, &more);
-			if (conn->connhost[i].hostaddr == NULL)
-				goto oom_error;
+			int			i;
+			char	   *s = conn->pghostaddr;
+			bool		more = true;
+
+			for (i = 0; i < conn->nconnhost && more; i++)
+			{
+				conn->connhost[i].hostaddr = parse_comma_separated_list(&s, &more);
+				if (conn->connhost[i].hostaddr == NULL)
+					goto oom_error;
+			}
+
+			/*
+			 * If hostaddr was given, the array was allocated according to the
+			 * number of elements in the hostaddr list, so it really should be the
+			 * right size.
+			 */
+			Assert(!more);
+			Assert(i == conn->nconnhost);
+		}
+
+		if (conn->pghost != NULL && conn->pghost[0] != '\0')
+		{
+			int			i;
+			char	   *s = conn->pghost;
+			bool		more = true;
+
+			for (i = 0; i < conn->nconnhost && more; i++)
+			{
+				conn->connhost[i].host = parse_comma_separated_list(&s, &more);
+				if (conn->connhost[i].host == NULL)
+					goto oom_error;
+			}
+
+			/* Check for wrong number of host items. */
+			if (more || i != conn->nconnhost)
+			{
+				conn->status = CONNECTION_BAD;
+				libpq_append_conn_error(conn, "could not match %d host names to %d hostaddr values",
+										count_comma_separated_elems(conn->pghost), conn->nconnhost);
+				return false;
+			}
 		}
 
 		/*
-		 * If hostaddr was given, the array was allocated according to the
-		 * number of elements in the hostaddr list, so it really should be the
-		 * right size.
+		 * Now, for each host slot, identify the type of address spec, and fill in
+		 * the default address if nothing was given.
 		 */
-		Assert(!more);
-		Assert(i == conn->nconnhost);
-	}
-
-	if (conn->pghost != NULL && conn->pghost[0] != '\0')
-	{
-		int			i;
-		char	   *s = conn->pghost;
-		bool		more = true;
-
-		for (i = 0; i < conn->nconnhost && more; i++)
+		for (int i = 0; i < conn->nconnhost; i++)
 		{
-			conn->connhost[i].host = parse_comma_separated_list(&s, &more);
-			if (conn->connhost[i].host == NULL)
-				goto oom_error;
-		}
+			pg_conn_host *ch = &conn->connhost[i];
 
-		/* Check for wrong number of host items. */
-		if (more || i != conn->nconnhost)
-		{
-			conn->status = CONNECTION_BAD;
-			libpq_append_conn_error(conn, "could not match %d host names to %d hostaddr values",
-									count_comma_separated_elems(conn->pghost), conn->nconnhost);
-			return false;
-		}
-	}
-
-	/*
-	 * Now, for each host slot, identify the type of address spec, and fill in
-	 * the default address if nothing was given.
-	 */
-	for (int i = 0; i < conn->nconnhost; i++)
-	{
-		pg_conn_host *ch = &conn->connhost[i];
-
-		if (ch->hostaddr != NULL && ch->hostaddr[0] != '\0')
-			ch->type = CHT_HOST_ADDRESS;
-		else if (ch->host != NULL && ch->host[0] != '\0')
-		{
-			ch->type = CHT_HOST_NAME;
-			if (is_unixsock_path(ch->host))
-				ch->type = CHT_UNIX_SOCKET;
-		}
-		else
-		{
-			free(ch->host);
-
-			/*
-			 * This bit selects the default host location.  If you change
-			 * this, see also pg_regress.
-			 */
-			if (DEFAULT_PGSOCKET_DIR[0])
+			if (ch->hostaddr != NULL && ch->hostaddr[0] != '\0')
+				ch->type = CHT_HOST_ADDRESS;
+			else if (ch->host != NULL && ch->host[0] != '\0')
 			{
-				ch->host = strdup(DEFAULT_PGSOCKET_DIR);
-				ch->type = CHT_UNIX_SOCKET;
+				ch->type = CHT_HOST_NAME;
+				if (is_unixsock_path(ch->host))
+					ch->type = CHT_UNIX_SOCKET;
 			}
 			else
 			{
-				ch->host = strdup(DefaultHost);
-				ch->type = CHT_HOST_NAME;
+				free(ch->host);
+
+				/*
+				 * This bit selects the default host location.  If you change
+				 * this, see also pg_regress.
+				 */
+				if (DEFAULT_PGSOCKET_DIR[0])
+				{
+					ch->host = strdup(DEFAULT_PGSOCKET_DIR);
+					ch->type = CHT_UNIX_SOCKET;
+				}
+				else
+				{
+					ch->host = strdup(DefaultHost);
+					ch->type = CHT_HOST_NAME;
+				}
+				if (ch->host == NULL)
+					goto oom_error;
 			}
-			if (ch->host == NULL)
-				goto oom_error;
 		}
 	}
 
@@ -4869,9 +4871,10 @@ error_return:
 static bool
 init_allowed_encryption_methods(PGconn *conn)
 {
-	if (conn->raddr.addr.ss_family == AF_UNIX)
+	if (conn->raddr.addr.ss_family == AF_UNIX ||
+		(conn->connhost && conn->connhost[conn->whichhost].type == CHT_XPC_SERVICE))
 	{
-		/* Don't request SSL or GSSAPI over Unix sockets */
+		/* Don't request SSL or GSSAPI over Unix sockets or XPC */
 		conn->allowed_enc_methods &= ~(ENC_SSL | ENC_GSSAPI);
 
 		/*

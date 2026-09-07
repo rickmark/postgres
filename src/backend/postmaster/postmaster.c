@@ -1712,6 +1712,8 @@ ServerLoop(void)
 		 */
 		for (int i = 0; i < nevents; i++)
 		{
+			pgsocket	xpc_sock = GetXPCListenSocket();
+
 			if (events[i].events & WL_LATCH_SET)
 				ResetLatch(MyLatch);
 
@@ -1731,37 +1733,49 @@ ServerLoop(void)
 			if (pending_pm_pmsignal)
 				process_pm_pmsignal();
 
-			if (events[i].events & WL_SOCKET_ACCEPT)
+			if (xpc_sock != PGINVALID_SOCKET && events[i].fd == xpc_sock)
 			{
 				ClientSocket s;
 
-				if (AcceptConnection(events[i].fd, &s) == STATUS_OK)
+				if (AcceptXPCConnection(&s) == STATUS_OK)
+				{
 					BackendStartup(&s);
-
-				/* We no longer need the open socket in this process */
-				if (s.sock != PGINVALID_SOCKET)
-				{
-					if (closesocket(s.sock) != 0)
-						elog(LOG, "could not close client socket: %m");
-				}
-			}
-
-			if (events[i].events & WL_SOCKET_READABLE)
-			{
-				pgsocket	xpc_sock = GetXPCListenSocket();
-
-				if (xpc_sock != PGINVALID_SOCKET && events[i].fd == xpc_sock)
-				{
-					ClientSocket s;
-
-					if (AcceptXPCConnection(&s) == STATUS_OK)
-						BackendStartup(&s);
 
 					/* We no longer need the open socket in this process */
 					if (s.sock != PGINVALID_SOCKET)
 					{
 						if (closesocket(s.sock) != 0)
 							elog(LOG, "could not close client socket: %m");
+					}
+				}
+			}
+			else if (events[i].events & WL_SOCKET_ACCEPT)
+			{
+				bool		is_listen_sock = false;
+
+				for (int j = 0; j < NumListenSockets; j++)
+				{
+					if (events[i].fd == ListenSockets[j])
+					{
+						is_listen_sock = true;
+						break;
+					}
+				}
+
+				if (is_listen_sock)
+				{
+					ClientSocket s;
+
+					if (AcceptConnection(events[i].fd, &s) == STATUS_OK)
+					{
+						BackendStartup(&s);
+
+						/* We no longer need the open socket in this process */
+						if (s.sock != PGINVALID_SOCKET)
+						{
+							if (closesocket(s.sock) != 0)
+								elog(LOG, "could not close client socket: %m");
+						}
 					}
 				}
 			}
